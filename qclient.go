@@ -1,27 +1,30 @@
 package qclient
 
 import (
-    "context"
+    "fmt"
     "io"
     "os"
     "bytes"
     "time"
-    "net/http"
-    "io/ioutil"
-    "github.com/qiniu/api.v7/auth/qbox"
-    "github.com/qiniu/api.v7/storage"
-    "strings"
-    "errors"
     "sync"
     "path"
+    "net/http"
+    "io/ioutil"
+    "context"
+    "strings"
+    "errors"
     "strconv"
+
+    "github.com/qiniu/api.v7/auth/qbox"
+    "github.com/qiniu/api.v7/storage"
 )
 
 const (
     retBody = `{"key":"$(key)","hash":"$(etag)","fsize":$(fsize),"bucket":"$(bucket)","name":"$(x:name)"}`
 )
 
-type Stat struct {
+// QStat 描述上传文件后的操作状态
+type QStat struct {
     Key    string
     Hash   string
     FSize  int
@@ -29,6 +32,13 @@ type Stat struct {
     Name   string
 }
 
+// OpStat 描述对文件管理的操作状态
+type OpStat struct {
+    Status  string
+    Message string
+}
+
+// FileInfo 描述文件的详细信息
 type FileInfo struct {
     Key      string `json:"key"`
     Hash     string `json:"hash"`
@@ -40,6 +50,7 @@ type FileInfo struct {
     Name     string `json:"name"`
 }
 
+// QClient 七牛对象存储客户端
 type QClient struct {
     accessKey  string
     secretKey  string
@@ -114,20 +125,100 @@ func (q *QClient) pathBase(fName string) string {
 
 }
 
+// trimPath path 路径修剪
+func (q *QClient) trimPath(path string, item storage.ListItem) (*FileInfo, bool) {
+
+    fi := FileInfo{
+        PutTime: item.PutTime,
+    }
+
+    if strings.LastIndex(item.Key, path) == 0 {
+        path = strings.Trim(path, "/ ")
+        key := strings.Trim(item.Key, "/ ")
+        spl1 := strings.Split(path, "/")
+        spl2 := strings.Split(key, "/")
+
+        ok := true
+        for i, v := range spl1 {
+            if spl2[i] != v {
+                ok = false
+                break
+            }
+        }
+
+        n1 := len(spl1)
+        n2 := len(spl2)
+
+        if ok && n2 > n1 {
+            fi.Name = spl2[n1]
+
+            if n2-n1 >= 2 {
+                fi.IsDir = true
+            } else {
+                fi.IsDir = false
+                fi.Key = item.Key
+                fi.Hash = item.Hash
+                fi.Type = item.Type
+                fi.MimeType = item.MimeType
+                fi.Size = item.Fsize
+
+            }
+            return &fi, true
+        }
+
+    }
+    return nil, false
+
+}
+
+// Delete 单个删除
+func (q *QClient) delete(path string) error {
+    deleteOps := make([]string, 0)
+    deleteOps = append(deleteOps, storage.URIDelete(q.bucket, path))
+
+    _, err := q.bktManager.Batch(deleteOps)
+    if err != nil {
+        return err
+    }
+    return nil
+}
+
+func (q *QClient) listItem(path string) []storage.ListItem {
+    var marker string
+    items := make([]storage.ListItem, 0)
+    for {
+        entries, _, nextMar, hasNext, err := q.bktManager.ListFiles(q.bucket, path, "", marker, 1000)
+        if err != nil {
+            return items
+        }
+
+        items = append(items, entries...)
+
+        if hasNext {
+            marker = nextMar
+        } else {
+            break
+        }
+    }
+    return items
+
+}
+
+// URLFor 生成公开连接地址
 func (q *QClient) URLFor(path string) string {
     deadline := time.Now().Add(time.Hour * 3).Unix()
     return storage.MakePrivateURL(q.mac, q.domain, path, deadline)
 }
 
 // Writer 负责把数据写入到七牛云存储
-func (q *QClient) Writer(path string, reader io.ReaderAt, fSize int64) (*Stat, error) {
+func (q *QClient) Writer(path string, reader io.ReaderAt, fSize int64) (*QStat, error) {
 
     policy := &storage.PutPolicy{
         Scope:       q.bucket,
         CallbackURL: q.cbURL,
         ReturnBody:  retBody,
     }
-    ret := Stat{}
+    ret := QStat{}
     extra := q.extra(path)
     err := q.uploader.Put(
         context.Background(),
@@ -141,12 +232,14 @@ func (q *QClient) Writer(path string, reader io.ReaderAt, fSize int64) (*Stat, e
     return &ret, err
 }
 
-func (q *QClient) Push(path string, data []byte) (*Stat, error) {
+// Push 用以把 data 推送到指定 path 下,path 即是data 数据在七牛云存储的 key
+func (q *QClient) Push(path string, data []byte) (*QStat, error) {
     stat, err := q.Writer(path, bytes.NewReader(data), int64(len(data)))
     return stat, err
 }
 
-func (q *QClient) PushFile(filename string) (*Stat, error) {
+// PushFile 推送指定文件到七牛云
+func (q *QClient) PushFile(filename string) (*QStat, error) {
     f, err := os.Open(filename)
     if err != nil {
         return nil, err
@@ -161,9 +254,9 @@ func (q *QClient) PushFile(filename string) (*Stat, error) {
 }
 
 //PushR 递归上传
-func (q *QClient) PushR(path string) []Stat {
+func (q *QClient) PushR(path string) []QStat {
 
-    stats := make([]Stat, 0)
+    stats := make([]QStat, 0)
     var wg sync.WaitGroup
 
     worker := func(fn string) {
@@ -202,6 +295,7 @@ func (q *QClient) PushR(path string) []Stat {
 
 }
 
+// Reader 从七牛云存储中中获取一个可读的 reader ，用以从其中读取数据
 func (q *QClient) Reader(path string, offset int64) (io.ReadCloser, error) {
     url := q.URLFor(path)
     req, err := http.NewRequest("GET", url, nil)
@@ -222,6 +316,7 @@ func (q *QClient) Reader(path string, offset int64) (io.ReadCloser, error) {
     return resp.Body, err
 }
 
+// Pull 拉取文件
 func (q *QClient) Pull(path string) ([]byte, error) {
     reader, err := q.Reader(path, 0)
     if err != nil {
@@ -256,68 +351,46 @@ func (q *QClient) PullTo(path, dst string) error {
     return err
 }
 
+// List 模仿Linux/unix ls 命令列举 path 下的所有文件,
 func (q *QClient) List(path string) []FileInfo {
+    filter := make(map[string]bool)
+
     fis := make([]FileInfo, 0)
-    var marker string
-    for {
-        entries, _, nextMar, hasNext, err := q.bktManager.ListFiles(q.bucket, path, "", marker, 1000)
-        if err != nil {
-            break
-        }
 
-        for _, en := range entries {
-            fi, ok := q.detail(path, &en)
-            if !ok {
-                continue
-            }
-            fis = append(fis, *fi)
-        }
+    items := q.listItem(path)
 
-        if hasNext {
-            marker = nextMar
-        } else {
-            break
+    for _, item := range items {
+        fi, ok := q.trimPath(path, item)
+        exist := filter[fi.Name]
+        if !ok || exist {
+            continue
         }
+        filter[fi.Name] = true
+        fis = append(fis, *fi)
     }
+
     return fis
 }
 
-func (q *QClient) detail(path string, item *storage.ListItem) (*FileInfo, bool) {
+// Delete 删除一个或者多个文件，支持按前缀删除
+func (q *QClient) Delete(paths ...string) []OpStat {
+    const (
+        ok  = "success"
+        bad = "error"
+    )
+    opStat := make([]OpStat, 0)
+    for _, path := range paths {
+        for _, v := range q.listItem(path) {
+            err := q.delete(v.Key)
 
-    fi := FileInfo{
-        Key:      item.Key,
-        Hash:     item.Hash,
-        Size:     item.Fsize,
-        PutTime:  item.PutTime,
-        MimeType: item.MimeType,
-        Type:     item.Type,
-    }
-
-    name := strings.Replace(item.Key, path, "", 1)
-    if len(name) <= 0 {
-        return nil, false
-    }
-
-    spl := strings.Split(name, "/")
-    if len(spl) <= 0 {
-        return nil, false
-    }
-
-    if len(spl) >= 2 {
-        fi.IsDir = true
-        if len(spl[0]) == 0 {
-            fi.Name = spl[1]
-        } else {
-            fi.Name = spl[0]
-        }
-    } else {
-        fi.IsDir = false
-        if len(spl[0]) == 0 {
-            return nil, false
-        } else {
-            fi.Name = spl[0]
+            if err == nil {
+                opStat = append(opStat, OpStat{ok, fmt.Sprintf("delete %s %s", v.Key, ok)})
+            } else {
+                opStat = append(opStat, OpStat{bad, fmt.Sprintf("delete %s %s ", v.Key, bad)})
+            }
         }
     }
-    return &fi, true
+
+    return opStat
 
 }

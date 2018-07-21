@@ -6,13 +6,14 @@ import (
     "fmt"
     "path"
     "strings"
+    "github.com/qiniu/api.v7/storage"
 )
 
 const (
-    ak  = "ak"
-    sk  = "sk"
-    bkt = "register"
-    dm  = "http://image.foryung.com"
+    ak  = "your_ak"
+    sk  = "your_sk"
+    bkt = "your_bucket"
+    dm  = "http://your_domain"
 )
 
 func TestQClient_PushFile(t *testing.T) {
@@ -105,21 +106,35 @@ func TestQClient_PushR3(t *testing.T) {
 
 func TestQClient_List(t *testing.T) {
     client := NewQClient(ak, sk, bkt, dm, false, true)
-    fis := client.List("/Users/zihua/Downloads/go")
+    fis := client.List("/Users/zihua/Desktop/register")
+
     for _, v := range fis {
+        fmt.Println(v.Name, v.IsDir)
         fmt.Printf("%#v", v)
     }
 
 }
 
-func TestQClient_PushR4(t *testing.T) {
-    v := "/Users/zihua/Downloads/go 系列/L001-Go语言-mp4/01 Go开发1期 day1 开课介绍01.mp4"
-    path := "/Users/zihua/Downloads"
-    name := strings.Replace(v, path, "", 1)
+func TestNewQClient(t *testing.T) {
+    client := NewQClient(ak, sk, bkt, dm, false, true)
+    item := storage.ListItem{
+        Key: "/Users/zihua/Downloads/go 系列/L001-Go语言-mp4/01 Go开发1期 day1 开课介绍01.mp4",
+    }
 
-    spl:=strings.Split(name,"/")
-    fmt.Println(name)
-    for _,v:=range spl{
-        fmt.Println(v)
+    path := "/Users/zihua/Downloads"
+    fis, ok := client.trimPath(path, item)
+    if ok {
+        t.Log(fis.Name)
+    } else {
+        t.Error(ok)
+    }
+
+}
+
+func TestQClient_Delete(t *testing.T) {
+    client := NewQClient(ak, sk, bkt, dm, false, true)
+    st := client.Delete("/Users/zihua/Desktop/register/")
+    for _, v := range st {
+        fmt.Println(v.Status, v.Message)
     }
 }
