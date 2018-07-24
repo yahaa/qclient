@@ -20,7 +20,7 @@ import (
 )
 
 const (
-    retBody = `{"key":"$(key)","hash":"$(etag)","fsize":$(fsize),"bucket":"$(bucket)","name":"$(x:name)"}`
+    defaultRetBody = `{"key":"$(key)","hash":"$(etag)","fsize":$(fsize),"bucket":"$(bucket)","name":"$(x:name)"}`
 )
 
 // QStat 描述上传文件后的操作状态
@@ -58,25 +58,21 @@ type QClient struct {
     domain     string
     endpoint   string
     config     *storage.Config
-    cbURL      string
     mac        *qbox.Mac
     bktManager *storage.BucketManager
     uploader   *storage.ResumeUploader
 }
 
-// cbURL=args[0],endpoint=args[1]
+// endpoint=args[0]
 func NewQClient(ak, sk, bucket, domain string, useHttps, useCDN bool, args ...string) (*QClient) {
 
     mac := qbox.NewMac(ak, sk)
     var (
-        cbURL    string
         endpoint string
     )
     switch len(args) {
-    case 2:
-        cbURL, endpoint = args[0], args[1]
     case 1:
-        cbURL = args[0]
+        endpoint = args[0]
     }
 
     cfg := storage.Config{
@@ -94,7 +90,6 @@ func NewQClient(ak, sk, bucket, domain string, useHttps, useCDN bool, args ...st
         endpoint:   endpoint,
         config:     &cfg,
         mac:        mac,
-        cbURL:      cbURL,
         bktManager: bktManager,
         uploader:   uploader,
     }
@@ -102,18 +97,16 @@ func NewQClient(ak, sk, bucket, domain string, useHttps, useCDN bool, args ...st
 }
 
 // extra 用于构造上传到七牛云存储上的扩展名
-func (q *QClient) extra(kind string) storage.RputExtra {
+func (q *QClient) extra(p map[string]string) storage.RputExtra {
     return storage.RputExtra{
-        Params: map[string]string{
-            "x:name": kind,
-        },
+        Params: p,
     }
 }
 
-// qPath 保证文件一定有前缀 "/"
+// qPath 保证文件前缀不能有 "/"
 func (q *QClient) qPath(path string) string {
-    if !strings.HasPrefix(path, "/") {
-        path = "/" + path
+    if strings.HasPrefix(path, "/") {
+        path = strings.Trim(path, "/ ")
     }
     return path
 
@@ -210,16 +203,40 @@ func (q *QClient) URLFor(path string) string {
     return storage.MakePrivateURL(q.mac, q.domain, path, deadline)
 }
 
-// Writer 负责把数据写入到七牛云存储
-func (q *QClient) Writer(path string, reader io.ReaderAt, fSize int64) (*QStat, error) {
+// Writer 负责把数据写入到七牛云存储 retBody=args[0],extraMap=args[1]
+// args[0] 是用户自定义回调结构体，数据类型为 string,格式形如: `{"key":"$(key)","hash":"$(etag)","fsize":$(fsize),"bucket":"$(bucket)","name":"$(x:name)"}`
+// args[1] 是 客户自定义的回调地址,数据类型为 string,格式形如: "http://www.aabb.com"
+// args[2] 是用户自定义的扩展信息，数据类型为 map[string]string,格式形如: map[string]string{"x:name":"zihua","x:password":"123456"}
+func (q *QClient) Writer(path string, reader io.ReaderAt, fSize int64, args ...interface{}) (*QStat, error) {
+
+    var (
+        retBody     = defaultRetBody
+        extraParams = make(map[string]string)
+        cbURL       string
+        cbBody      string
+    )
+
+    switch len(args) {
+    case 1:
+        retBody = args[0].(string)
+        extraParams["x:name"] = path
+    case 2:
+        retBody, cbURL = args[0].(string), args[1].(string)
+        cbBody = retBody
+        extraParams["x:name"] = path
+    case 3:
+        retBody, cbURL, extraParams = args[0].(string), args[1].(string), args[2].(map[string]string)
+        cbBody = retBody
+    }
 
     policy := &storage.PutPolicy{
-        Scope:       q.bucket,
-        CallbackURL: q.cbURL,
-        ReturnBody:  retBody,
+        Scope:        q.bucket,
+        CallbackURL:  cbURL,
+        ReturnBody:   retBody,
+        CallbackBody: cbBody,
     }
     ret := QStat{}
-    extra := q.extra(path)
+    extra := q.extra(extraParams)
     err := q.uploader.Put(
         context.Background(),
         &ret,
@@ -233,13 +250,13 @@ func (q *QClient) Writer(path string, reader io.ReaderAt, fSize int64) (*QStat, 
 }
 
 // Push 用以把 data 推送到指定 path 下,path 即是data 数据在七牛云存储的 key
-func (q *QClient) Push(path string, data []byte) (*QStat, error) {
-    stat, err := q.Writer(path, bytes.NewReader(data), int64(len(data)))
+func (q *QClient) Push(path string, data []byte, args ...interface{}) (*QStat, error) {
+    stat, err := q.Writer(path, bytes.NewReader(data), int64(len(data)), args...)
     return stat, err
 }
 
 // PushFile 推送指定文件到七牛云
-func (q *QClient) PushFile(filename string) (*QStat, error) {
+func (q *QClient) PushFile(filename string, args ...interface{}) (*QStat, error) {
     f, err := os.Open(filename)
     if err != nil {
         return nil, err
@@ -249,7 +266,7 @@ func (q *QClient) PushFile(filename string) (*QStat, error) {
     if err != nil {
         return nil, err
     }
-    ret, err := q.Writer(filename, f, info.Size())
+    ret, err := q.Writer(filename, f, info.Size(), args...)
     return ret, err
 }
 
